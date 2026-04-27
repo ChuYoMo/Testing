@@ -18,23 +18,43 @@ from engine import MatchingEngine
 from models import Asset, OrderPlacementResult, OrderSide, TradingPair
 from wallet import WalletService
 
+_SUPPORTED_PAIRS = [
+    TradingPair(Asset.BTC, Asset.USDT),
+    TradingPair(Asset.ETH, Asset.USDT),
+    TradingPair(Asset.ETH, Asset.BTC),
+]
+
 
 def build_demo_services() -> tuple[AuthService, WalletService, SimpleBlockchain, MatchingEngine]:
-    """构造演示用服务实例。"""
+    """构造纯内存演示服务实例（测试用）。"""
     auth_service = AuthService()
     wallet_service = WalletService(supported_assets=[Asset.BTC, Asset.ETH, Asset.USDT])
     blockchain = SimpleBlockchain(block_capacity=2)
-
-    supported_pairs = [
-        TradingPair(Asset.BTC, Asset.USDT),
-        TradingPair(Asset.ETH, Asset.USDT),
-        TradingPair(Asset.ETH, Asset.BTC),
-    ]
     engine = MatchingEngine(
         auth_service=auth_service,
         wallet_service=wallet_service,
         blockchain=blockchain,
-        supported_pairs=supported_pairs,
+        supported_pairs=_SUPPORTED_PAIRS,
+    )
+    return auth_service, wallet_service, blockchain, engine
+
+
+def build_persistent_services(
+    db_path: str = "dex.db",
+) -> tuple[AuthService, WalletService, SimpleBlockchain, MatchingEngine]:
+    """构造 SQLite 持久化服务实例（GUI / 生产用）。"""
+    from database import init_db
+
+    conn = init_db(db_path)
+    auth_service = AuthService(conn=conn)
+    wallet_service = WalletService(supported_assets=[Asset.BTC, Asset.ETH, Asset.USDT], conn=conn)
+    blockchain = SimpleBlockchain(block_capacity=2, conn=conn)
+    engine = MatchingEngine(
+        auth_service=auth_service,
+        wallet_service=wallet_service,
+        blockchain=blockchain,
+        supported_pairs=_SUPPORTED_PAIRS,
+        conn=conn,
     )
     return auth_service, wallet_service, blockchain, engine
 

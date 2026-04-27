@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
-from typing import Dict, Iterable
+import sqlite3
+from decimal import Decimal
+from typing import Dict, Iterable, Optional
 
 from exceptions import (
     InsufficientBalanceError,
@@ -26,16 +28,59 @@ from models import Asset, Wallet, ensure_positive, normalize_decimal
 
 
 class WalletService:
-    """内存钱包服务。"""
+    """内存钱包服务，可选 SQLite 持久化。"""
 
-    def __init__(self, supported_assets: Iterable[Asset]) -> None:
+    def __init__(
+        self,
+        supported_assets: Iterable[Asset],
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> None:
         self._supported_assets = set(supported_assets)
+        self._conn = conn
         self._wallets: Dict[str, Wallet] = {}
+        if conn:
+            self._load_from_db()
+
+    def _load_from_db(self) -> None:
+        """从数据库加载所有钱包余额到内存。"""
+        rows = self._conn.execute(
+            "SELECT owner, asset, available, frozen FROM wallets"
+        ).fetchall()
+        for row in rows:
+            owner = row["owner"]
+            if owner not in self._wallets:
+                self._wallets[owner] = Wallet(owner=owner)
+            asset = Asset(row["asset"])
+            self._wallets[owner].balances[asset] = Decimal(row["available"])
+            self._wallets[owner].frozen_balances[asset] = Decimal(row["frozen"])
+
+    def _flush_asset(self, user_id: str, asset: Asset) -> None:
+        """将单个 (user, asset) 余额行写回数据库。"""
+        if not self._conn:
+            return
+        wallet = self._wallets[user_id]
+        self._conn.execute(
+            "INSERT OR REPLACE INTO wallets (owner, asset, available, frozen) VALUES (?, ?, ?, ?)",
+            (
+                user_id,
+                asset.value,
+                str(wallet.balances[asset]),
+                str(wallet.frozen_balances[asset]),
+            ),
+        )
+        self._conn.commit()
 
     def create_wallet_for_user(self, user_id: str) -> Wallet:
         """为用户创建钱包；若已存在则直接返回。"""
         if user_id not in self._wallets:
             self._wallets[user_id] = Wallet(owner=user_id)
+            if self._conn:
+                for asset in self._supported_assets:
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO wallets (owner, asset, available, frozen) VALUES (?, ?, ?, ?)",
+                        (user_id, asset.value, "0.00000000", "0.00000000"),
+                    )
+                self._conn.commit()
         return self._wallets[user_id]
 
     def get_wallet(self, user_id: str) -> Wallet:
@@ -70,6 +115,7 @@ class WalletService:
         ensure_positive(decimal_amount, "充值金额")
         wallet = self.get_wallet(user_id)
         wallet.balances[asset] += decimal_amount
+        self._flush_asset(user_id, asset)
 
     def withdraw(self, user_id: str, asset: Asset, amount: object) -> None:
         """提现。"""
@@ -80,6 +126,7 @@ class WalletService:
         if wallet.balances[asset] < decimal_amount:
             raise InsufficientBalanceError("可用余额不足，无法提现。")
         wallet.balances[asset] -= decimal_amount
+        self._flush_asset(user_id, asset)
 
     def freeze(self, user_id: str, asset: Asset, amount: object) -> None:
         """冻结可用余额。"""
@@ -91,6 +138,7 @@ class WalletService:
             raise InsufficientBalanceError("可用余额不足，无法冻结。")
         wallet.balances[asset] -= decimal_amount
         wallet.frozen_balances[asset] += decimal_amount
+        self._flush_asset(user_id, asset)
 
     def unfreeze(self, user_id: str, asset: Asset, amount: object) -> None:
         """解冻冻结余额。"""
@@ -102,6 +150,7 @@ class WalletService:
             raise InsufficientFrozenBalanceError("冻结余额不足，无法解冻。")
         wallet.frozen_balances[asset] -= decimal_amount
         wallet.balances[asset] += decimal_amount
+        self._flush_asset(user_id, asset)
 
     def consume_frozen(self, user_id: str, asset: Asset, amount: object) -> None:
         """消耗冻结余额，用于成交结算。"""
@@ -112,6 +161,7 @@ class WalletService:
         if wallet.frozen_balances[asset] < decimal_amount:
             raise InsufficientFrozenBalanceError("冻结余额不足，无法扣减。")
         wallet.frozen_balances[asset] -= decimal_amount
+        self._flush_asset(user_id, asset)
 
     def assert_user_has_wallet(self, user_id: str) -> None:
         """显式校验钱包是否存在。"""
