@@ -5,9 +5,9 @@ import unittest
 
 from app import run_demo
 from blockchain import SimpleBlockchain
-from exceptions import ValidationError
+from exceptions import EmptyOrderBookError, ValidationError
 from gui import DEXWebState
-from models import normalize_decimal
+from models import Asset, normalize_decimal
 
 
 def money(value: str) -> Decimal:
@@ -152,6 +152,136 @@ class TradingFlowTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ValidationError):
                     normalize_decimal(value)
+
+    def test_market_buy_walks_book_across_levels(self) -> None:
+        state = DEXWebState(db_path=":memory:")
+        state.wallet_service.deposit("alice", Asset.USDT, "20000")
+        state.wallet_service.deposit("carol", Asset.BTC, "0.5")
+        state.place_order(
+            {"username": "bob", "pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.4"}
+        )
+        state.place_order(
+            {"username": "carol", "pair": "BTC/USDT", "side": "SELL", "price": "30100", "quantity": "0.3"}
+        )
+
+        result = state.place_order(
+            {
+                "username": "alice",
+                "pair": "BTC/USDT",
+                "side": "BUY",
+                "type": "MARKET",
+                "quantity": "0.5",
+            }
+        )
+        self.assertIn("市价单", result["message"])
+
+        snapshot = state.snapshot()
+        alice_orders = [o for o in snapshot["orders"] if o["user"] == "alice"]
+        self.assertEqual(len(alice_orders), 1)
+        self.assertEqual(alice_orders[0]["type"], "MARKET")
+        self.assertEqual(alice_orders[0]["status"], "FILLED")
+        self.assertEqual(alice_orders[0]["filled"], "0.50000000")
+        self.assertEqual(Decimal(alice_orders[0]["price"]), Decimal("0"))
+
+        # alice 起始 50000 + 充值 20000 = 70000 USDT；
+        # 消耗 0.4 @ 30000 + 0.1 @ 30100 = 15010；剩 54990。
+        alice_usdt = next(
+            row for row in snapshot["wallets"] if row["user"] == "alice" and row["asset"] == "USDT"
+        )
+        self.assertEqual(Decimal(alice_usdt["available"]), Decimal("54990.00000000"))
+        self.assertEqual(Decimal(alice_usdt["frozen"]), Decimal("0"))
+        alice_btc = next(
+            row for row in snapshot["wallets"] if row["user"] == "alice" and row["asset"] == "BTC"
+        )
+        self.assertEqual(Decimal(alice_btc["available"]), Decimal("0.50000000"))
+
+        btc_book = snapshot["order_books"]["BTC/USDT"]
+        self.assertEqual(len(btc_book["sell"]), 1)
+        self.assertEqual(btc_book["sell"][0]["user_id"], "carol")
+        self.assertEqual(btc_book["sell"][0]["remaining_quantity"], "0.20000000")
+
+    def test_market_sell_consumes_buy_side_liquidity(self) -> None:
+        state = DEXWebState(db_path=":memory:")
+        state.place_order(
+            {"username": "alice", "pair": "BTC/USDT", "side": "BUY", "price": "31000", "quantity": "0.2"}
+        )
+
+        state.place_order(
+            {
+                "username": "bob",
+                "pair": "BTC/USDT",
+                "side": "SELL",
+                "type": "MARKET",
+                "quantity": "0.2",
+            }
+        )
+
+        snapshot = state.snapshot()
+        bob_usdt = next(
+            row for row in snapshot["wallets"] if row["user"] == "bob" and row["asset"] == "USDT"
+        )
+        self.assertEqual(Decimal(bob_usdt["available"]), Decimal("6200.00000000"))
+        bob_btc = next(
+            row for row in snapshot["wallets"] if row["user"] == "bob" and row["asset"] == "BTC"
+        )
+        self.assertEqual(Decimal(bob_btc["available"]), Decimal("0.80000000"))
+        self.assertEqual(Decimal(bob_btc["frozen"]), Decimal("0"))
+
+    def test_market_order_rejects_when_liquidity_insufficient(self) -> None:
+        state = DEXWebState(db_path=":memory:")
+        state.wallet_service.deposit("alice", Asset.USDT, "20000")
+        state.place_order(
+            {"username": "bob", "pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.1"}
+        )
+
+        with self.assertRaises(EmptyOrderBookError):
+            state.place_order(
+                {
+                    "username": "alice",
+                    "pair": "BTC/USDT",
+                    "side": "BUY",
+                    "type": "MARKET",
+                    "quantity": "0.5",
+                }
+            )
+
+        # 拒绝时不应冻结资金
+        snapshot = state.snapshot()
+        alice_usdt = next(
+            row for row in snapshot["wallets"] if row["user"] == "alice" and row["asset"] == "USDT"
+        )
+        self.assertEqual(Decimal(alice_usdt["frozen"]), Decimal("0"))
+        self.assertEqual(Decimal(alice_usdt["available"]), Decimal("70000.00000000"))
+
+    def test_market_order_skips_self_orders(self) -> None:
+        state = DEXWebState(db_path=":memory:")
+        state.wallet_service.deposit("alice", Asset.BTC, "1")
+        state.wallet_service.deposit("alice", Asset.USDT, "20000")
+        state.place_order(
+            {"username": "alice", "pair": "BTC/USDT", "side": "SELL", "price": "29000", "quantity": "0.1"}
+        )
+        state.place_order(
+            {"username": "bob", "pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.5"}
+        )
+
+        # 市价买单 0.3 BTC：应跳过 alice 自有卖单，全部从 bob 处吃单
+        state.place_order(
+            {
+                "username": "alice",
+                "pair": "BTC/USDT",
+                "side": "BUY",
+                "type": "MARKET",
+                "quantity": "0.3",
+            }
+        )
+
+        snapshot = state.snapshot()
+        # alice 自有卖单仍在 bob 卖单之前（价格更低），不应被消耗
+        sell_book = snapshot["order_books"]["BTC/USDT"]["sell"]
+        alice_sell = next(o for o in sell_book if o["user_id"] == "alice")
+        self.assertEqual(alice_sell["remaining_quantity"], "0.10000000")
+        bob_sell = next(o for o in sell_book if o["user_id"] == "bob")
+        self.assertEqual(bob_sell["remaining_quantity"], "0.20000000")
 
 
 if __name__ == "__main__":

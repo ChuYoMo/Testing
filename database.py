@@ -10,6 +10,7 @@ def init_db(db_path: str = "dex.db") -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     _create_tables(conn)
+    _migrate_schema(conn)
     return conn
 
 
@@ -56,7 +57,8 @@ def _create_tables(conn: sqlite3.Connection) -> None:
             remaining_quantity TEXT NOT NULL,
             status             TEXT NOT NULL,
             created_at         TEXT NOT NULL,
-            sequence           INTEGER NOT NULL
+            sequence           INTEGER NOT NULL,
+            order_type         TEXT NOT NULL DEFAULT 'LIMIT'
         );
         CREATE TABLE IF NOT EXISTS trades (
             trade_id      TEXT PRIMARY KEY,
@@ -83,3 +85,13 @@ def _create_tables(conn: sqlite3.Connection) -> None:
         );
     """)
     conn.commit()
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """对已存在的 schema 做幂等增量迁移。"""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)")}
+    if "order_type" not in columns:
+        conn.execute(
+            "ALTER TABLE orders ADD COLUMN order_type TEXT NOT NULL DEFAULT 'LIMIT'"
+        )
+        conn.commit()

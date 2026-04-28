@@ -12,6 +12,10 @@ from __future__ import annotations
 
 import errno
 import json
+import os
+import sys
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
@@ -19,7 +23,7 @@ from urllib.parse import urlparse
 
 from app import build_demo_services, build_persistent_services
 from exceptions import DEXError, UserAlreadyExistsError, ValidationError
-from models import Asset, OrderSide, TradingPair
+from models import Asset, OrderSide, OrderType, TradingPair
 
 
 HOST = "127.0.0.1"
@@ -128,18 +132,30 @@ class DEXWebState:
         self._ensure_registered(username)
         pair = PAIRS[str(payload.get("pair", ""))]
         side = OrderSide(str(payload.get("side", "")))
-        result = self.engine.place_limit_order(
-            user_id=username,
-            pair=pair,
-            side=side,
-            price=str(payload.get("price", "")).strip(),
-            quantity=str(payload.get("quantity", "")).strip(),
-        )
+        order_type = OrderType(str(payload.get("type", "LIMIT")).upper() or "LIMIT")
+        quantity = str(payload.get("quantity", "")).strip()
+
+        if order_type == OrderType.MARKET:
+            result = self.engine.place_market_order(
+                user_id=username,
+                pair=pair,
+                side=side,
+                quantity=quantity,
+            )
+        else:
+            result = self.engine.place_limit_order(
+                user_id=username,
+                pair=pair,
+                side=side,
+                price=str(payload.get("price", "")).strip(),
+                quantity=quantity,
+            )
         self._record_order_flow(result)
         blocked = "，自成交保护已触发" if result.self_trade_blocked else ""
+        type_label = "市价单" if order_type == OrderType.MARKET else "限价单"
         return {
             "message": (
-                f"订单 {result.order.order_id} 提交成功，状态 {result.order.status.value}，"
+                f"{type_label} {result.order.order_id} 提交成功，状态 {result.order.status.value}，"
                 f"本次成交 {len(result.trades)} 笔{blocked}。"
             )
         }
@@ -259,6 +275,7 @@ class DEXWebState:
                     "user": order.user_id,
                     "pair": order.pair.symbol,
                     "side": order.side.value,
+                    "type": order.order_type.value,
                     "price": str(order.price),
                     "quantity": str(order.quantity),
                     "filled": str(order.filled_quantity),
@@ -286,6 +303,7 @@ class DEXWebState:
             "pairs": list(PAIRS),
             "assets": [asset.value for asset in Asset],
             "sides": [side.value for side in OrderSide],
+            "order_types": [order_type.value for order_type in OrderType],
         }
 
     @staticmethod
@@ -304,6 +322,7 @@ class DEXWebState:
             "user": order.user_id,
             "pair": order.pair.symbol,
             "side": order.side.value,
+            "type": order.order_type.value,
             "price": str(order.price),
             "quantity": str(order.quantity),
             "filled": str(order.filled_quantity),
@@ -317,6 +336,7 @@ class DEXWebState:
         """Append a GUI flow row for a manually submitted order."""
         order = result.order
         side_text = "买单" if order.side is OrderSide.BUY else "卖单"
+        type_text = "市价" if order.order_type is OrderType.MARKET else "限价"
         trade_count = len(result.trades)
         if trade_count:
             description = f"订单触发撮合，生成 {trade_count} 笔成交。"
@@ -327,7 +347,7 @@ class DEXWebState:
         self.last_trade_flow.append(
             self._flow_step(
                 len(self.last_trade_flow) + 1,
-                f"{order.user_id} 提交 {order.pair.symbol} {side_text}",
+                f"{order.user_id} 提交 {order.pair.symbol} {type_text}{side_text}",
                 description,
                 result,
             )
@@ -550,6 +570,43 @@ INDEX_HTML = r"""<!doctype html>
       background: var(--red);
     }
     button.cancel-btn:hover { background: #b13a3a; }
+    .type-tabs {
+      display: flex;
+      gap: 6px;
+      margin-bottom: 10px;
+    }
+    .type-tabs button {
+      flex: 1;
+      width: auto;
+      height: 30px;
+      background: #e7ebef;
+      color: var(--ink);
+      font-weight: 600;
+      font-size: 13px;
+    }
+    .type-tabs button.active {
+      background: var(--blue);
+      color: #fff;
+    }
+    .badge.type-limit { background: #eef6ff; color: var(--blue); }
+    .badge.type-market { background: #fff5e7; color: var(--gold); }
+    .depth-cell {
+      position: relative;
+      display: block;
+    }
+    .depth-cell .depth-bar {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      right: 0;
+      opacity: .35;
+      border-radius: 4px;
+    }
+    .depth-cell .depth-text {
+      position: relative;
+    }
+    .depth-cell.buy .depth-bar { background: #c9ecdd; }
+    .depth-cell.sell .depth-bar { background: #f8d4d4; }
     .row {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -784,7 +841,11 @@ INDEX_HTML = r"""<!doctype html>
       </div>
 
       <div class="control-panel">
-        <h2>限价下单</h2>
+        <h2>下单</h2>
+        <div class="type-tabs">
+          <button id="typeLimitBtn" class="active" onclick="setOrderType('LIMIT')">限价</button>
+          <button id="typeMarketBtn" onclick="setOrderType('MARKET')">市价</button>
+        </div>
         <div class="field-grid">
           <div class="wide">
             <label for="orderUser">用户</label>
@@ -798,7 +859,7 @@ INDEX_HTML = r"""<!doctype html>
             <label for="orderSide">方向</label>
             <select id="orderSide"></select>
           </div>
-          <div>
+          <div id="orderPriceField">
             <label for="orderPrice">价格</label>
             <input id="orderPrice" value="31000">
           </div>
@@ -864,6 +925,14 @@ INDEX_HTML = r"""<!doctype html>
   <script>
     let state = null;
     let activeRequests = 0;
+    let currentOrderType = "LIMIT";
+
+    function setOrderType(type) {
+      currentOrderType = type;
+      typeLimitBtn.classList.toggle("active", type === "LIMIT");
+      typeMarketBtn.classList.toggle("active", type === "MARKET");
+      orderPriceField.classList.toggle("hidden", type === "MARKET");
+    }
 
     function setStatus(message, failed = false) {
       const box = document.getElementById("status");
@@ -968,13 +1037,17 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function placeOrder() {
-      postAction("/api/order", {
+      const payload = {
         username: orderUser.value,
         pair: orderPair.value,
         side: orderSide.value,
-        price: orderPrice.value,
+        type: currentOrderType,
         quantity: orderQuantity.value
-      }, "订单提交成功。");
+      };
+      if (currentOrderType === "LIMIT") {
+        payload.price = orderPrice.value;
+      }
+      postAction("/api/order", payload, "订单提交成功。");
     }
 
     function sealBlock() {
@@ -1054,22 +1127,29 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderOrders() {
       orders.innerHTML = table(
-        ["订单ID", "用户", "交易对", "方向", "价格", "数量", "已成交", "剩余", "状态", "操作"],
+        ["订单ID", "用户", "交易对", "类型", "方向", "价格", "数量", "已成交", "剩余", "状态", "操作"],
         state.orders.map(row => [
           row.id,
           row.user,
           row.pair,
+          orderTypeCell(row.type),
           sideCell(row.side),
-          formatDecimal(row.price),
+          row.type === "MARKET" ? "市价" : formatDecimal(row.price),
           formatDecimal(row.quantity),
           formatDecimal(row.filled),
           formatDecimal(row.remaining),
           statusCell(row.status),
           (row.status === "OPEN" || row.status === "PARTIALLY_FILLED")
-            ? `<button class="cancel-btn" onclick="cancelOrder('${row.id}','${row.user}')">撤单</button>`
+            ? raw(`<button class="cancel-btn" onclick="cancelOrder('${escapeHTML(row.id)}','${escapeHTML(row.user)}')">撤单</button>`)
             : ""
         ])
       );
+    }
+
+    function orderTypeCell(type) {
+      const klass = type === "MARKET" ? "type-market" : "type-limit";
+      const label = type === "MARKET" ? "MARKET" : "LIMIT";
+      return raw(`<span class="badge ${klass}">${escapeHTML(label)}</span>`);
     }
 
     function cancelOrder(orderId, owner) {
@@ -1084,14 +1164,52 @@ INDEX_HTML = r"""<!doctype html>
     function renderBooks() {
       const rows = [];
       for (const [pair, book] of Object.entries(state.order_books)) {
+        const maxSell = sideMax(book.sell);
+        const maxBuy = sideMax(book.buy);
         for (const order of book.sell) {
-          rows.push([pair, sideCell("SELL"), order.order_id, order.user_id, formatDecimal(order.price), formatDecimal(order.remaining_quantity), statusCell(order.status)]);
+          rows.push([
+            pair,
+            sideCell("SELL"),
+            order.order_id,
+            order.user_id,
+            formatDecimal(order.price),
+            depthCell(order.remaining_quantity, maxSell, "sell"),
+            statusCell(order.status)
+          ]);
         }
         for (const order of book.buy) {
-          rows.push([pair, sideCell("BUY"), order.order_id, order.user_id, formatDecimal(order.price), formatDecimal(order.remaining_quantity), statusCell(order.status)]);
+          rows.push([
+            pair,
+            sideCell("BUY"),
+            order.order_id,
+            order.user_id,
+            formatDecimal(order.price),
+            depthCell(order.remaining_quantity, maxBuy, "buy"),
+            statusCell(order.status)
+          ]);
         }
       }
       books.innerHTML = table(["交易对", "方向", "订单ID", "用户", "价格", "剩余数量", "状态"], rows);
+    }
+
+    function sideMax(orders) {
+      let max = 0;
+      for (const o of orders) {
+        const v = Number(o.remaining_quantity);
+        if (Number.isFinite(v) && v > max) max = v;
+      }
+      return max;
+    }
+
+    function depthCell(value, max, side) {
+      const num = Number(value);
+      const pct = max > 0 && Number.isFinite(num) ? Math.max(6, (num / max) * 100) : 0;
+      return raw(
+        `<span class="depth-cell ${side}">` +
+          `<span class="depth-bar" style="width:${pct.toFixed(2)}%"></span>` +
+          `<span class="depth-text">${escapeHTML(formatDecimal(value))}</span>` +
+        `</span>`
+      );
     }
 
     function renderFlow() {
@@ -1203,14 +1321,31 @@ INDEX_HTML = r"""<!doctype html>
 
 
 def main() -> None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, OSError):
+        pass
+    reload_enabled = "--no-reload" not in sys.argv
     server = _build_server()
-    print(f"DEX GUI running at http://{HOST}:{PORT}")
+    reload_event = threading.Event()
+    if reload_enabled:
+        watcher = threading.Thread(
+            target=_watch_sources, args=(server, reload_event), daemon=True
+        )
+        watcher.start()
+        print(f"DEX GUI running at http://{HOST}:{PORT}  (auto-reload on .py change)")
+    else:
+        print(f"DEX GUI running at http://{HOST}:{PORT}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+
+    if reload_event.is_set():
+        print("代码已变更，正在重启服务器...")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def _build_server() -> ThreadingHTTPServer:
@@ -1226,6 +1361,42 @@ def _build_server() -> ThreadingHTTPServer:
         PORT = port
         return server
     raise OSError(f"无法在 {HOST}:{PORT}-{PORT + MAX_PORT_ATTEMPTS - 1} 范围内启动 GUI。")
+
+
+def _source_signature() -> dict[str, float]:
+    """Snapshot mtime of every .py under the project directory."""
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    sigs: dict[str, float] = {}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        for fname in files:
+            if fname.endswith(".py"):
+                path = os.path.join(root, fname)
+                try:
+                    sigs[path] = os.path.getmtime(path)
+                except OSError:
+                    pass
+    return sigs
+
+
+def _watch_sources(server: ThreadingHTTPServer, reload_event: threading.Event) -> None:
+    """轮询源文件 mtime，发现改动则触发服务器关闭并设置 reload 标志。"""
+    initial = _source_signature()
+    while not reload_event.is_set():
+        time.sleep(0.8)
+        current = _source_signature()
+        changed = [
+            path
+            for path in set(initial) | set(current)
+            if initial.get(path) != current.get(path)
+        ]
+        if changed:
+            rels = [os.path.basename(path) for path in changed[:3]]
+            extra = "" if len(changed) <= 3 else f" 等 {len(changed)} 个文件"
+            print(f"检测到代码变更：{', '.join(rels)}{extra}")
+            reload_event.set()
+            server.shutdown()
+            return
 
 
 if __name__ == "__main__":

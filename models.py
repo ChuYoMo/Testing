@@ -69,6 +69,13 @@ class OrderStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class OrderType(str, Enum):
+    """订单类型枚举。"""
+
+    LIMIT = "LIMIT"
+    MARKET = "MARKET"
+
+
 @dataclass(frozen=True)
 class TradingPair:
     """交易对定义，例如 BTC/USDT。"""
@@ -131,7 +138,7 @@ class Wallet:
 
 @dataclass
 class Order:
-    """限价订单实体。"""
+    """订单实体，承载限价单与市价单。"""
 
     order_id: str
     user_id: str
@@ -143,6 +150,7 @@ class Order:
     status: OrderStatus
     created_at: datetime
     sequence: int
+    order_type: OrderType = OrderType.LIMIT
 
     @property
     def filled_quantity(self) -> Decimal:
