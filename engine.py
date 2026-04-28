@@ -2,10 +2,10 @@
 """订单与撮合模块。
 
 核心规则：
-1. 仅支持限价单；
+1. 支持限价单与市价单；
 2. 价格优先、时间优先；
 3. 支持部分成交与完全成交；
-4. 默认启用自成交保护：当最优对手单来自同一用户时，撮合停止。
+4. 默认启用自成交保护：限价单遇到同一用户对手单则停止；市价单跳过自有订单。
 
 测试友好性设计：
 - 订单 ID / 成交 ID / 顺序号均由内置计数器生成，便于断言；
@@ -25,6 +25,9 @@ from typing import Callable, DefaultDict, Dict, Iterable, List, Optional
 from auth import AuthService
 from blockchain import SimpleBlockchain
 from exceptions import (
+    EmptyOrderBookError,
+    OrderNotCancellableError,
+    OrderNotFoundError,
     UnsupportedTradingPairError,
     ValidationError,
 )
@@ -33,6 +36,7 @@ from models import (
     OrderPlacementResult,
     OrderSide,
     OrderStatus,
+    OrderType,
     Trade,
     TradingPair,
     ZERO,
@@ -58,6 +62,15 @@ class OrderBook:
     def get_orders(self, pair: TradingPair, side: OrderSide) -> List[Order]:
         """返回指定交易对与方向的订单列表（内部引用）。"""
         return self._select_book(pair, side)
+
+    def remove(self, order: Order) -> bool:
+        """从订单簿中移除指定订单。已不在簿中返回 False。"""
+        book = self._select_book(order.pair, order.side)
+        for index, candidate in enumerate(book):
+            if candidate.order_id == order.order_id:
+                book.pop(index)
+                return True
+        return False
 
     def snapshot(self, pair: TradingPair) -> Dict[str, List[dict]]:
         """返回订单簿快照。"""
@@ -90,6 +103,7 @@ class OrderBook:
             "status": order.status.value,
             "created_at": order.created_at.isoformat(),
             "sequence": order.sequence,
+            "order_type": order.order_type.value,
         }
 
 
@@ -122,7 +136,7 @@ class MatchingEngine:
     def _load_from_db(self) -> None:
         """从数据库恢复订单，重建订单簿并还原序列计数器。"""
         for row in self._conn.execute(
-            "SELECT order_id, user_id, pair, side, price, quantity, remaining_quantity, status, created_at, sequence FROM orders"
+            "SELECT order_id, user_id, pair, side, price, quantity, remaining_quantity, status, created_at, sequence, order_type FROM orders"
         ):
             pair = self._supported_pairs.get(row["pair"])
             if pair is None:
@@ -138,6 +152,7 @@ class MatchingEngine:
                 status=OrderStatus(row["status"]),
                 created_at=datetime.fromisoformat(row["created_at"]),
                 sequence=row["sequence"],
+                order_type=OrderType(row["order_type"]),
             )
             self._orders[order.order_id] = order
             if order.is_active():
@@ -158,8 +173,8 @@ class MatchingEngine:
         """将订单（含状态更新）写入数据库。"""
         self._conn.execute(
             """INSERT OR REPLACE INTO orders
-               (order_id, user_id, pair, side, price, quantity, remaining_quantity, status, created_at, sequence)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (order_id, user_id, pair, side, price, quantity, remaining_quantity, status, created_at, sequence, order_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 order.order_id,
                 order.user_id,
@@ -171,6 +186,7 @@ class MatchingEngine:
                 order.status.value,
                 order.created_at.isoformat(),
                 order.sequence,
+                order.order_type.value,
             ),
         )
 
@@ -251,12 +267,131 @@ class MatchingEngine:
             self_trade_blocked=self_trade_blocked,
         )
 
+    def place_market_order(
+        self,
+        user_id: str,
+        pair: TradingPair,
+        side: OrderSide,
+        quantity: object,
+    ) -> OrderPlacementResult:
+        """提交市价单。
+
+        - 按 quantity 走对手簿（排除自有订单）；
+        - 若可用流动性不足，抛出 EmptyOrderBookError 并不冻结资金；
+        - BUY：按预走结果精确冻结所需 quote 资产；
+        - SELL：冻结 quantity 数量的 base 资产；
+        - 市价单不进簿，剩余直接 CANCELLED（自成交跳过保留兜底）。
+        """
+        self._validate_user(user_id)
+        self._validate_pair(pair)
+
+        decimal_quantity = normalize_decimal(quantity)
+        ensure_positive(decimal_quantity, "数量")
+
+        opposite_side = OrderSide.SELL if side == OrderSide.BUY else OrderSide.BUY
+        opposite_book = self._order_book.get_orders(pair, opposite_side)
+        matchable = [maker for maker in opposite_book if maker.user_id != user_id]
+        available_qty = sum(
+            (maker.remaining_quantity for maker in matchable),
+            ZERO,
+        )
+        if available_qty < decimal_quantity:
+            raise EmptyOrderBookError(
+                f"对手方可成交数量 {available_qty} 不足以满足市价单 {decimal_quantity}。"
+            )
+
+        if side == OrderSide.BUY:
+            remaining = decimal_quantity
+            required_quote = ZERO
+            for maker in matchable:
+                take = min(remaining, maker.remaining_quantity)
+                required_quote = normalize_decimal(required_quote + maker.price * take)
+                remaining -= take
+                if remaining <= ZERO:
+                    break
+            self._wallet_service.freeze(user_id, pair.quote_asset, required_quote)
+        else:
+            self._wallet_service.freeze(user_id, pair.base_asset, decimal_quantity)
+
+        order = Order(
+            order_id=f"O{next(self._order_id_sequence):06d}",
+            user_id=user_id,
+            pair=pair,
+            side=side,
+            price=ZERO,
+            quantity=decimal_quantity,
+            remaining_quantity=decimal_quantity,
+            status=OrderStatus.OPEN,
+            created_at=self._clock(),
+            sequence=next(self._order_sequence),
+            order_type=OrderType.MARKET,
+        )
+
+        trades, self_trade_blocked = self._match_order(order)
+
+        if order.is_active():
+            order.status = OrderStatus.CANCELLED
+
+        self._orders[order.order_id] = order
+
+        if self._conn:
+            self._persist_order(order)
+            for trade in trades:
+                maker_id = (
+                    trade.sell_order_id if order.side == OrderSide.BUY else trade.buy_order_id
+                )
+                self._persist_order(self._orders[maker_id])
+                self._persist_trade(trade)
+            self._conn.commit()
+
+        return OrderPlacementResult(
+            order=order,
+            trades=trades,
+            self_trade_blocked=self_trade_blocked,
+        )
+
     def get_order(self, order_id: str) -> Order:
         """获取订单详情。"""
         try:
             return self._orders[order_id]
         except KeyError as exc:
             raise ValidationError(f"订单 {order_id} 不存在。") from exc
+
+    def cancel_order(self, user_id: str, order_id: str) -> Order:
+        """撤销活跃订单，解冻剩余资金。
+
+        :raises OrderNotFoundError: 订单不存在。
+        :raises ValidationError: 不是该用户的订单。
+        :raises OrderNotCancellableError: 订单已成交或已撤销。
+        """
+        order = self._orders.get(order_id)
+        if order is None:
+            raise OrderNotFoundError(f"订单 {order_id} 不存在。")
+        if order.user_id != user_id:
+            raise ValidationError(f"订单 {order_id} 不属于用户 {user_id}。")
+        if not order.is_active():
+            raise OrderNotCancellableError(
+                f"订单 {order_id} 当前状态为 {order.status.value}，不可撤销。"
+            )
+
+        if order.side == OrderSide.BUY:
+            refund_asset = order.pair.quote_asset
+            refund_amount = normalize_decimal(order.price * order.remaining_quantity)
+        else:
+            refund_asset = order.pair.base_asset
+            refund_amount = order.remaining_quantity
+
+        if refund_amount > ZERO:
+            self._wallet_service.unfreeze(order.user_id, refund_asset, refund_amount)
+
+        self._order_book.remove(order)
+        order.status = OrderStatus.CANCELLED
+
+        if self._conn:
+            self._persist_order(order)
+            self._conn.commit()
+
+        return order
 
     def get_order_book_snapshot(self, pair: TradingPair) -> dict:
         """获取订单簿快照。"""
@@ -286,19 +421,27 @@ class MatchingEngine:
             self._wallet_service.freeze(order.user_id, order.pair.base_asset, order.quantity)
 
     def _match_order(self, taker_order: Order) -> tuple[List[Trade], bool]:
-        """执行撮合主循环。"""
+        """执行撮合主循环。
+
+        - 限价单遇到同一用户的对手单时停止（自成交保护）；
+        - 市价单跳过自有订单，继续匹配后续档位。
+        """
         trades: List[Trade] = []
         self_trade_blocked = False
         opposite_side = OrderSide.SELL if taker_order.side == OrderSide.BUY else OrderSide.BUY
         opposite_book = self._order_book.get_orders(taker_order.pair, opposite_side)
 
-        while taker_order.remaining_quantity > ZERO and opposite_book:
-            maker_order = opposite_book[0]
+        pointer = 0
+        while taker_order.remaining_quantity > ZERO and pointer < len(opposite_book):
+            maker_order = opposite_book[pointer]
 
             if not self._is_price_crossed(taker_order, maker_order):
                 break
 
             if maker_order.user_id == taker_order.user_id:
+                if taker_order.order_type == OrderType.MARKET:
+                    pointer += 1
+                    continue
                 self_trade_blocked = True
                 break
 
@@ -314,14 +457,16 @@ class MatchingEngine:
             self._blockchain.add_trade(trade)
 
             if maker_order.remaining_quantity == ZERO:
-                opposite_book.pop(0)
+                opposite_book.pop(pointer)
 
         taker_order.refresh_status()
         return trades, self_trade_blocked
 
     @staticmethod
     def _is_price_crossed(taker_order: Order, maker_order: Order) -> bool:
-        """判断买卖价格是否可成交。"""
+        """判断买卖价格是否可成交。市价单恒为可成交。"""
+        if taker_order.order_type == OrderType.MARKET:
+            return True
         if taker_order.side == OrderSide.BUY:
             return taker_order.price >= maker_order.price
         return taker_order.price <= maker_order.price
