@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DEX 核心系统可视化</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand">
+        <h1>DEX 操作台</h1>
+        <span class="badge" id="pendingBadge">0 待打包</span>
+      </div>
+
+      <div class="control-panel">
+        <h2>用户认证</h2>
+        <div id="authLoggedOut">
+          <div class="field-grid">
+            <div>
+              <label for="authUser">用户名</label>
+              <input id="authUser" value="alice">
+            </div>
+            <div>
+              <label for="authPass">密码</label>
+              <input id="authPass" type="password" value="alice123">
+            </div>
+          </div>
+          <div class="row">
+            <button onclick="registerUser()">注册</button>
+            <button class="success" onclick="loginUser()">登录</button>
+          </div>
+        </div>
+        <div id="authLoggedIn" class="hidden">
+          <div class="logged-in-card">
+            <span class="logged-in-label">已登录</span>
+            <strong id="authLoggedInUser">-</strong>
+          </div>
+          <button class="warning" onclick="logoutUser()">退出登录</button>
+        </div>
+      </div>
+
+      <div class="control-panel">
+        <h2>钱包操作</h2>
+        <div class="op-user-hint">操作用户：<strong id="walletOpUser">未登录</strong></div>
+        <div class="field-grid">
+          <div>
+            <label for="walletAsset">币种</label>
+            <select id="walletAsset"></select>
+          </div>
+          <div>
+            <label for="walletAmount">金额</label>
+            <input id="walletAmount" value="1000">
+          </div>
+        </div>
+        <div class="row">
+          <button class="success" onclick="walletAction('deposit')">充值</button>
+          <button class="warning" onclick="walletAction('withdraw')">提现</button>
+        </div>
+      </div>
+
+      <div class="control-panel">
+        <h2>下单</h2>
+        <div class="op-user-hint">操作用户：<strong id="orderOpUser">未登录</strong></div>
+        <div class="type-tabs">
+          <button id="typeLimitBtn" class="active" onclick="setOrderType('LIMIT')">限价</button>
+          <button id="typeMarketBtn" onclick="setOrderType('MARKET')">市价</button>
+        </div>
+        <div class="field-grid">
+          <div>
+            <label for="orderPair">交易对</label>
+            <select id="orderPair"></select>
+          </div>
+          <div>
+            <label for="orderSide">方向</label>
+            <select id="orderSide"></select>
+          </div>
+          <div id="orderPriceField">
+            <label for="orderPrice">价格</label>
+            <input id="orderPrice" value="31000">
+          </div>
+          <div>
+            <label for="orderQuantity">数量</label>
+            <input id="orderQuantity" value="0.1">
+          </div>
+        </div>
+        <button style="margin-top:10px" onclick="placeOrder()">提交订单</button>
+      </div>
+
+      <div class="control-panel">
+        <h2>系统操作</h2>
+        <div class="stack">
+          <button class="success" onclick="runDemoFlow()">执行交易流程</button>
+          <div class="row">
+            <button class="secondary" onclick="sealBlock()">封装区块</button>
+            <button class="secondary" onclick="validateChain()">校验链</button>
+          </div>
+          <div class="row">
+            <button class="danger" onclick="resetDemo()">重置</button>
+            <button class="secondary" onclick="loadState()">刷新</button>
+          </div>
+        </div>
+      </div>
+      <div class="status" id="status">正在加载系统状态...</div>
+    </aside>
+
+    <main>
+      <div class="metrics">
+        <div class="metric"><span>当前用户</span><strong id="metricUser">未登录</strong></div>
+        <div class="metric"><span>用户数</span><strong id="metricUsers">0</strong></div>
+        <div class="metric"><span>订单数</span><strong id="metricOrders">0</strong></div>
+        <div class="metric"><span>区块数</span><strong id="metricBlocks">0</strong></div>
+      </div>
+
+      <section>
+        <div class="section-head">
+          <h2>业务数据</h2>
+          <div class="tabs">
+            <button class="active" onclick="showTab('wallets', this)">钱包</button>
+            <button onclick="showTab('orders', this)">订单</button>
+            <button onclick="showTab('books', this)">订单簿</button>
+            <button onclick="showTab('flow', this)">交易流程</button>
+          </div>
+        </div>
+        <div id="wallets" class="table-wrap"></div>
+        <div id="orders" class="table-wrap hidden"></div>
+        <div id="books" class="table-wrap hidden"></div>
+        <div id="flow" class="table-wrap hidden"></div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>链式账本</h2>
+          <span id="pendingInfo"></span>
+        </div>
+        <div id="chain" class="table-wrap"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

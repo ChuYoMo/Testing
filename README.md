@@ -265,11 +265,20 @@ python3 -m unittest discover -v
 | `test_market_sell_consumes_buy_side_liquidity` | 市价卖单吃买盘流动性、基础资产扣减与计价资产入账 |
 | `test_market_order_rejects_when_liquidity_insufficient` | 流动性不足时市价单直接拒绝、不冻结资金 |
 | `test_market_order_skips_self_orders` | 市价单跳过自身挂单、与他人订单成交 |
+| `AuthServiceTest.test_login_returns_token_and_resolves_user` | 登录返回 token，token 可解析回当前用户 |
+| `AuthServiceTest.test_logout_invalidates_token` | 登出后 token 立即失效 |
+| `AuthServiceTest.test_login_with_wrong_password_raises` | 密码错误抛 `InvalidCredentialsError` |
+| `AuthServiceTest.test_login_with_unknown_user_raises` | 用户不存在抛 `UserNotFoundError` |
+| `HttpAuthIntegrationTest.test_protected_route_without_token_returns_401` | 受保护接口缺少 Authorization 头返回 401 |
+| `HttpAuthIntegrationTest.test_protected_route_with_invalid_token_returns_401` | 非法 token 返回 401 |
+| `HttpAuthIntegrationTest.test_login_returns_token_and_wallet_works_with_it` | 登录拿到 token 后能成功调用钱包接口 |
+| `HttpAuthIntegrationTest.test_wallet_uses_token_user_not_body_username` | 操作主体只取 token，请求体里夹带的 `username` 被忽略 |
+| `HttpAuthIntegrationTest.test_logout_invalidates_token_for_subsequent_requests` | 登出后旧 token 再次请求受保护接口返回 401 |
 
 期望结果：
 
 ```text
-Ran 9 tests
+Ran 18 tests
 OK
 ```
 
@@ -376,16 +385,15 @@ python3 generate_document_package.py
 - 没有真实钱包地址和私钥管理。
 - 没有手续费模型。
 - 没有并发锁或事务机制（SQLite 提供基本的写锁，未做多进程协调）。
-- GUI 中钱包和下单操作通过用户名指定用户，没有完整权限隔离模型。
-- JSON API 中登录会生成 token，但当前 GUI 操作接口未强制要求 token。
+- 鉴权基于 Bearer Token：登录成功后浏览器把 token 写入 `localStorage`，所有受保护接口（钱包、下单、撤单、登出）都从 `Authorization: Bearer <token>` 请求头解析操作主体，请求体中夹带的 `username` 会被忽略，因此用户只能操作自己的钱包与订单。
+- 会话存储在内存与 SQLite，未做 token 过期、刷新或多端互踢策略。
 
 ## 后续扩展
 
 建议优先补充以下内容：
 
-1. 认证模块独立单元测试：重复注册、错误密码、无效 token、登出。
+1. 认证模块更全面的测试：重复注册、token 过期/刷新策略、并发登录互踢。
 2. 钱包模块独立单元测试：余额不足、冻结不足、非法金额、不支持币种。
 3. 撮合模块独立单元测试：价格优先、时间优先、自成交保护、不支持交易对、撤单边界。
 4. 区块链模块独立单元测试：空封块、自动封块、篡改交易、篡改哈希。
 5. 功能扩展：手续费、历史订单查询、止损/止盈单、深度图。
-6. API 扩展：基于 token 的权限校验、用户只能操作自己的钱包和订单。

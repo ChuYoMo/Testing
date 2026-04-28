@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 from decimal import Decimal
+import json
+import threading
 import unittest
+import urllib.error
+import urllib.request
 
+import gui
 from app import run_demo
+from auth import AuthService
 from blockchain import SimpleBlockchain
-from exceptions import EmptyOrderBookError, ValidationError
+from exceptions import (
+    EmptyOrderBookError,
+    InvalidCredentialsError,
+    UserNotFoundError,
+    ValidationError,
+)
 from gui import DEXWebState
+from http.server import ThreadingHTTPServer
 from models import Asset, normalize_decimal
 
 
@@ -90,24 +102,18 @@ class TradingFlowTest(unittest.TestCase):
 
     def test_gui_manual_order_flow_records_trade_details(self) -> None:
         state = DEXWebState(db_path=":memory:")
-        state.place_order(
-            {
-                "username": "bob",
+        state.place_order({
                 "pair": "BTC/USDT",
                 "side": "SELL",
                 "price": "30000",
                 "quantity": "1",
-            }
-        )
-        state.place_order(
-            {
-                "username": "alice",
+            }, user="bob")
+        state.place_order({
                 "pair": "BTC/USDT",
                 "side": "BUY",
                 "price": "31000",
                 "quantity": "0.4",
-            }
-        )
+            }, user="alice")
         snapshot = state.snapshot()
 
         self.assertEqual(len(snapshot["last_trade_flow"]), 2)
@@ -157,22 +163,15 @@ class TradingFlowTest(unittest.TestCase):
         state = DEXWebState(db_path=":memory:")
         state.wallet_service.deposit("alice", Asset.USDT, "20000")
         state.wallet_service.deposit("carol", Asset.BTC, "0.5")
-        state.place_order(
-            {"username": "bob", "pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.4"}
-        )
-        state.place_order(
-            {"username": "carol", "pair": "BTC/USDT", "side": "SELL", "price": "30100", "quantity": "0.3"}
-        )
+        state.place_order({"pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.4"}, user="bob")
+        state.place_order({"pair": "BTC/USDT", "side": "SELL", "price": "30100", "quantity": "0.3"}, user="carol")
 
-        result = state.place_order(
-            {
-                "username": "alice",
+        result = state.place_order({
                 "pair": "BTC/USDT",
                 "side": "BUY",
                 "type": "MARKET",
                 "quantity": "0.5",
-            }
-        )
+            }, user="alice")
         self.assertIn("市价单", result["message"])
 
         snapshot = state.snapshot()
@@ -202,19 +201,14 @@ class TradingFlowTest(unittest.TestCase):
 
     def test_market_sell_consumes_buy_side_liquidity(self) -> None:
         state = DEXWebState(db_path=":memory:")
-        state.place_order(
-            {"username": "alice", "pair": "BTC/USDT", "side": "BUY", "price": "31000", "quantity": "0.2"}
-        )
+        state.place_order({"pair": "BTC/USDT", "side": "BUY", "price": "31000", "quantity": "0.2"}, user="alice")
 
-        state.place_order(
-            {
-                "username": "bob",
+        state.place_order({
                 "pair": "BTC/USDT",
                 "side": "SELL",
                 "type": "MARKET",
                 "quantity": "0.2",
-            }
-        )
+            }, user="bob")
 
         snapshot = state.snapshot()
         bob_usdt = next(
@@ -230,20 +224,15 @@ class TradingFlowTest(unittest.TestCase):
     def test_market_order_rejects_when_liquidity_insufficient(self) -> None:
         state = DEXWebState(db_path=":memory:")
         state.wallet_service.deposit("alice", Asset.USDT, "20000")
-        state.place_order(
-            {"username": "bob", "pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.1"}
-        )
+        state.place_order({"pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.1"}, user="bob")
 
         with self.assertRaises(EmptyOrderBookError):
-            state.place_order(
-                {
-                    "username": "alice",
+            state.place_order({
                     "pair": "BTC/USDT",
                     "side": "BUY",
                     "type": "MARKET",
                     "quantity": "0.5",
-                }
-            )
+                }, user="alice")
 
         # 拒绝时不应冻结资金
         snapshot = state.snapshot()
@@ -257,23 +246,16 @@ class TradingFlowTest(unittest.TestCase):
         state = DEXWebState(db_path=":memory:")
         state.wallet_service.deposit("alice", Asset.BTC, "1")
         state.wallet_service.deposit("alice", Asset.USDT, "20000")
-        state.place_order(
-            {"username": "alice", "pair": "BTC/USDT", "side": "SELL", "price": "29000", "quantity": "0.1"}
-        )
-        state.place_order(
-            {"username": "bob", "pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.5"}
-        )
+        state.place_order({"pair": "BTC/USDT", "side": "SELL", "price": "29000", "quantity": "0.1"}, user="alice")
+        state.place_order({"pair": "BTC/USDT", "side": "SELL", "price": "30000", "quantity": "0.5"}, user="bob")
 
         # 市价买单 0.3 BTC：应跳过 alice 自有卖单，全部从 bob 处吃单
-        state.place_order(
-            {
-                "username": "alice",
+        state.place_order({
                 "pair": "BTC/USDT",
                 "side": "BUY",
                 "type": "MARKET",
                 "quantity": "0.3",
-            }
-        )
+            }, user="alice")
 
         snapshot = state.snapshot()
         # alice 自有卖单仍在 bob 卖单之前（价格更低），不应被消耗
@@ -282,6 +264,156 @@ class TradingFlowTest(unittest.TestCase):
         self.assertEqual(alice_sell["remaining_quantity"], "0.10000000")
         bob_sell = next(o for o in sell_book if o["user_id"] == "bob")
         self.assertEqual(bob_sell["remaining_quantity"], "0.20000000")
+
+
+class AuthServiceTest(unittest.TestCase):
+    def test_login_returns_token_and_resolves_user(self) -> None:
+        service = AuthService()
+        service.register("dave", "dave-secret")
+        token = service.login("dave", "dave-secret")
+
+        self.assertTrue(service.is_authenticated(token))
+        self.assertEqual(service.get_user_by_token(token).username, "dave")
+
+    def test_logout_invalidates_token(self) -> None:
+        service = AuthService()
+        service.register("dave", "dave-secret")
+        token = service.login("dave", "dave-secret")
+
+        service.logout(token)
+
+        self.assertFalse(service.is_authenticated(token))
+        with self.assertRaises(InvalidCredentialsError):
+            service.get_user_by_token(token)
+
+    def test_login_with_wrong_password_raises(self) -> None:
+        service = AuthService()
+        service.register("dave", "dave-secret")
+
+        with self.assertRaises(InvalidCredentialsError):
+            service.login("dave", "wrong-password")
+
+    def test_login_with_unknown_user_raises(self) -> None:
+        service = AuthService()
+        with self.assertRaises(UserNotFoundError):
+            service.login("ghost", "irrelevant")
+
+
+class HttpAuthIntegrationTest(unittest.TestCase):
+    """启动一个真正的 ThreadingHTTPServer 测试鉴权链路。"""
+
+    def setUp(self) -> None:
+        gui.STATE = DEXWebState(db_path=":memory:")
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), gui.DEXRequestHandler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        host, port = self._server.server_address
+        self._base = f"http://{host}:{port}"
+
+    def tearDown(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+    def _request(
+        self,
+        path: str,
+        payload: dict | None = None,
+        token: str | None = None,
+        method: str | None = None,
+    ) -> tuple[int, dict]:
+        body = None
+        headers = {}
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(
+            self._base + path,
+            data=body,
+            headers=headers,
+            method=method or ("POST" if payload is not None else "GET"),
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def _login(self, username: str, password: str) -> str:
+        status, body = self._request("/api/login", {"username": username, "password": password})
+        self.assertEqual(status, 200)
+        return body["token"]
+
+    def test_protected_route_without_token_returns_401(self) -> None:
+        status, body = self._request(
+            "/api/wallet",
+            {"asset": "USDT", "amount": "1", "action": "deposit"},
+        )
+        self.assertEqual(status, 401)
+        self.assertIn("Authorization", body["error"])
+
+    def test_protected_route_with_invalid_token_returns_401(self) -> None:
+        status, body = self._request(
+            "/api/wallet",
+            {"asset": "USDT", "amount": "1", "action": "deposit"},
+            token="not-a-real-token",
+        )
+        self.assertEqual(status, 401)
+        self.assertIn("会话令牌", body["error"])
+
+    def test_login_returns_token_and_wallet_works_with_it(self) -> None:
+        token = self._login("alice", "alice123")
+        status, body = self._request(
+            "/api/wallet",
+            {"asset": "USDT", "amount": "100", "action": "deposit"},
+            token=token,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["data"]["current_user"], "alice")
+
+    def test_wallet_uses_token_user_not_body_username(self) -> None:
+        """请求体里夹带 username 不应改变操作主体——以 token 解析的用户为准。"""
+        alice_token = self._login("alice", "alice123")
+        status, body = self._request(
+            "/api/wallet",
+            {
+                "username": "bob",
+                "asset": "USDT",
+                "amount": "100",
+                "action": "deposit",
+            },
+            token=alice_token,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("alice 充值", body["message"])
+        alice_usdt = next(
+            row
+            for row in body["data"]["wallets"]
+            if row["user"] == "alice" and row["asset"] == "USDT"
+        )
+        bob_usdt = next(
+            row
+            for row in body["data"]["wallets"]
+            if row["user"] == "bob" and row["asset"] == "USDT"
+        )
+        self.assertEqual(Decimal(alice_usdt["available"]), Decimal("50100.00000000"))
+        self.assertEqual(Decimal(bob_usdt["available"]), Decimal("0"))
+
+    def test_logout_invalidates_token_for_subsequent_requests(self) -> None:
+        token = self._login("alice", "alice123")
+        status, _ = self._request("/api/logout", {}, token=token)
+        self.assertEqual(status, 200)
+
+        status, body = self._request(
+            "/api/wallet",
+            {"asset": "USDT", "amount": "1", "action": "deposit"},
+            token=token,
+        )
+        self.assertEqual(status, 401)
+        self.assertIn("会话令牌", body["error"])
 
 
 if __name__ == "__main__":
