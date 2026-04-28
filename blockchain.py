@@ -2,36 +2,77 @@
 """区块链/链式账本模拟模块。
 
 教学目标：
-- 用最小实现体现“前一区块哈希 + 当前区块哈希”的链式不可篡改思想；
+- 用最小实现体现"前一区块哈希 + 当前区块哈希"的链式不可篡改思想；
 - 将撮合产生的成交记录持久化为链上交易列表；
 - 支持链完整性校验，便于测试 tamper 场景。
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 from copy import deepcopy
 from datetime import UTC, datetime
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from exceptions import ChainValidationError, EmptyBlockError, InvalidBlockError
 from models import Block, Trade
 
 
 class SimpleBlockchain:
-    """简化区块链实现。"""
+    """简化区块链实现，可选 SQLite 持久化。"""
 
     def __init__(
         self,
         clock: Callable[[], datetime] | None = None,
         block_capacity: int = 2,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         if block_capacity <= 0:
             raise InvalidBlockError("block_capacity 必须大于 0。")
         self._clock = clock or (lambda: datetime.now(UTC))
         self._block_capacity = block_capacity
+        self._conn = conn
         self._chain: List[Block] = []
         self._pending_transactions: List[Dict[str, str]] = []
-        self._create_genesis_block()
+        if conn:
+            self._load_from_db()
+        if not self._chain:
+            self._create_genesis_block()
+
+    def _load_from_db(self) -> None:
+        """从数据库恢复区块链和待打包交易。"""
+        for row in self._conn.execute(
+            "SELECT block_index, timestamp, previous_hash, block_hash, transactions FROM blocks ORDER BY block_index"
+        ):
+            block = Block(
+                index=row["block_index"],
+                timestamp=datetime.fromisoformat(row["timestamp"]),
+                previous_hash=row["previous_hash"],
+                transactions=json.loads(row["transactions"]),
+                block_hash=row["block_hash"],
+            )
+            self._chain.append(block)
+        for row in self._conn.execute(
+            "SELECT tx_data FROM pending_transactions ORDER BY id"
+        ):
+            self._pending_transactions.append(json.loads(row["tx_data"]))
+
+    def _persist_block(self, block: Block) -> None:
+        """将区块写入数据库。"""
+        if not self._conn:
+            return
+        self._conn.execute(
+            "INSERT OR REPLACE INTO blocks (block_index, timestamp, previous_hash, block_hash, transactions) VALUES (?, ?, ?, ?, ?)",
+            (
+                block.index,
+                block.timestamp.isoformat(),
+                block.previous_hash,
+                block.block_hash,
+                json.dumps(block.transactions, ensure_ascii=False),
+            ),
+        )
+        self._conn.commit()
 
     @property
     def chain(self) -> List[Block]:
@@ -58,6 +99,7 @@ class SimpleBlockchain:
         )
         genesis.block_hash = genesis.compute_hash()
         self._chain.append(genesis)
+        self._persist_block(genesis)
 
     def add_transaction(self, transaction: Dict[str, str]) -> None:
         """添加待打包交易。
@@ -67,6 +109,12 @@ class SimpleBlockchain:
         if not transaction or not isinstance(transaction, dict):
             raise InvalidBlockError("交易记录不能为空，且必须为字典。")
         self._pending_transactions.append(deepcopy(transaction))
+        if self._conn:
+            self._conn.execute(
+                "INSERT INTO pending_transactions (tx_data) VALUES (?)",
+                (json.dumps(transaction, ensure_ascii=False),),
+            )
+            self._conn.commit()
         if len(self._pending_transactions) >= self._block_capacity:
             self.seal_pending_transactions()
 
@@ -91,6 +139,10 @@ class SimpleBlockchain:
         block.block_hash = block.compute_hash()
         self._chain.append(block)
         self._pending_transactions.clear()
+        if self._conn:
+            self._persist_block(block)
+            self._conn.execute("DELETE FROM pending_transactions")
+            self._conn.commit()
         return deepcopy(block)
 
     def validate_chain(self) -> bool:

@@ -17,7 +17,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 import hashlib
 import secrets
-from typing import Callable, Dict
+import sqlite3
+from typing import Callable, Dict, Optional
 
 from exceptions import (
     InvalidCredentialsError,
@@ -65,11 +66,27 @@ class AuthService:
         self,
         clock: Callable[[], datetime] | None = None,
         password_hasher: PasswordHasher | None = None,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._password_hasher = password_hasher or PasswordHasher()
+        self._conn = conn
         self._users: Dict[str, User] = {}
         self._sessions: Dict[str, str] = {}
+        if conn:
+            self._load_from_db()
+
+    def _load_from_db(self) -> None:
+        """从数据库加载用户和会话到内存。"""
+        for row in self._conn.execute("SELECT username, password_hash, password_salt, created_at FROM users"):
+            self._users[row["username"]] = User(
+                username=row["username"],
+                password_hash=row["password_hash"],
+                password_salt=row["password_salt"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+        for row in self._conn.execute("SELECT token, username FROM sessions"):
+            self._sessions[row["token"]] = row["username"]
 
     def register(self, username: str, password: str) -> User:
         """注册用户。
@@ -90,6 +107,12 @@ class AuthService:
             created_at=self._clock(),
         )
         self._users[normalized_username] = user
+        if self._conn:
+            self._conn.execute(
+                "INSERT INTO users (username, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?)",
+                (user.username, user.password_hash, user.password_salt, user.created_at.isoformat()),
+            )
+            self._conn.commit()
         return user
 
     def login(self, username: str, password: str) -> str:
@@ -110,11 +133,20 @@ class AuthService:
             raise InvalidCredentialsError("用户名或密码错误。")
         token = secrets.token_hex(16)
         self._sessions[token] = user.username
+        if self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO sessions (token, username) VALUES (?, ?)",
+                (token, user.username),
+            )
+            self._conn.commit()
         return token
 
     def logout(self, token: str) -> None:
         """登出指定会话。"""
         self._sessions.pop(token, None)
+        if self._conn:
+            self._conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+            self._conn.commit()
 
     def is_authenticated(self, token: str) -> bool:
         """校验会话令牌是否有效。"""

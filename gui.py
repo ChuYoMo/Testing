@@ -17,8 +17,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from app import build_demo_services
-from exceptions import DEXError, ValidationError
+from app import build_demo_services, build_persistent_services
+from exceptions import DEXError, UserAlreadyExistsError, ValidationError
 from models import Asset, OrderSide, TradingPair
 
 
@@ -34,18 +34,48 @@ PAIRS = {
 
 
 class DEXWebState:
-    """Owns the in-memory services used by the GUI server."""
+    """Owns the SQLite-backed services used by the GUI server."""
 
     def __init__(self) -> None:
-        self.reset()
-
-    def reset(self) -> None:
-        self.auth_service, self.wallet_service, self.blockchain, self.engine = build_demo_services()
+        from database import init_db
+        self._conn = init_db()
         self.current_user: str | None = None
         self.last_trade_flow: list[dict[str, Any]] = []
+        self._rebuild_services()
+        self._seed_demo_accounts()
+
+    def _rebuild_services(self) -> None:
+        """用当前 conn 重新创建所有服务实例（init 或 reset 后调用）。"""
+        from auth import AuthService
+        from blockchain import SimpleBlockchain
+        from engine import MatchingEngine
+        from wallet import WalletService
+        from app import _SUPPORTED_PAIRS
+
+        self.auth_service = AuthService(conn=self._conn)
+        self.wallet_service = WalletService(
+            supported_assets=[Asset.BTC, Asset.ETH, Asset.USDT], conn=self._conn
+        )
+        self.blockchain = SimpleBlockchain(block_capacity=2, conn=self._conn)
+        self.engine = MatchingEngine(
+            auth_service=self.auth_service,
+            wallet_service=self.wallet_service,
+            blockchain=self.blockchain,
+            supported_pairs=_SUPPORTED_PAIRS,
+            conn=self._conn,
+        )
+
+    def reset(self) -> None:
+        from database import clear_db
+        clear_db(self._conn)
+        self.current_user = None
+        self.last_trade_flow = []
+        self._rebuild_services()
         self._seed_demo_accounts()
 
     def _seed_demo_accounts(self) -> None:
+        if self.auth_service.list_users():
+            return
         for username, password in [
             ("alice", "alice123"),
             ("bob", "bob123"),

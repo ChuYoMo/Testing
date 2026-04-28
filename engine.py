@@ -15,11 +15,12 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections import defaultdict
 from datetime import UTC, datetime
 from decimal import Decimal
 from itertools import count
-from typing import Callable, DefaultDict, Dict, Iterable, List
+from typing import Callable, DefaultDict, Dict, Iterable, List, Optional
 
 from auth import AuthService
 from blockchain import SimpleBlockchain
@@ -93,7 +94,7 @@ class OrderBook:
 
 
 class MatchingEngine:
-    """DEX 限价撮合引擎。"""
+    """DEX 限价撮合引擎，可选 SQLite 持久化。"""
 
     def __init__(
         self,
@@ -102,17 +103,96 @@ class MatchingEngine:
         blockchain: SimpleBlockchain,
         supported_pairs: Iterable[TradingPair],
         clock: Callable[[], datetime] | None = None,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> None:
         self._auth_service = auth_service
         self._wallet_service = wallet_service
         self._blockchain = blockchain
         self._supported_pairs = {pair.symbol: pair for pair in supported_pairs}
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._conn = conn
         self._order_book = OrderBook()
         self._order_sequence = count(1)
         self._order_id_sequence = count(1)
         self._trade_id_sequence = count(1)
         self._orders: Dict[str, Order] = {}
+        if conn:
+            self._load_from_db()
+
+    def _load_from_db(self) -> None:
+        """从数据库恢复订单，重建订单簿并还原序列计数器。"""
+        for row in self._conn.execute(
+            "SELECT order_id, user_id, pair, side, price, quantity, remaining_quantity, status, created_at, sequence FROM orders"
+        ):
+            pair = self._supported_pairs.get(row["pair"])
+            if pair is None:
+                continue
+            order = Order(
+                order_id=row["order_id"],
+                user_id=row["user_id"],
+                pair=pair,
+                side=OrderSide(row["side"]),
+                price=Decimal(row["price"]),
+                quantity=Decimal(row["quantity"]),
+                remaining_quantity=Decimal(row["remaining_quantity"]),
+                status=OrderStatus(row["status"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                sequence=row["sequence"],
+            )
+            self._orders[order.order_id] = order
+            if order.is_active():
+                self._order_book.add(order)
+
+        max_seq = self._conn.execute("SELECT COALESCE(MAX(sequence), 0) FROM orders").fetchone()[0]
+        max_order_num = self._conn.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTR(order_id, 2) AS INTEGER)), 0) FROM orders"
+        ).fetchone()[0]
+        max_trade_num = self._conn.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTR(trade_id, 2) AS INTEGER)), 0) FROM trades"
+        ).fetchone()[0]
+        self._order_sequence = count(int(max_seq) + 1)
+        self._order_id_sequence = count(int(max_order_num) + 1)
+        self._trade_id_sequence = count(int(max_trade_num) + 1)
+
+    def _persist_order(self, order: Order) -> None:
+        """将订单（含状态更新）写入数据库。"""
+        self._conn.execute(
+            """INSERT OR REPLACE INTO orders
+               (order_id, user_id, pair, side, price, quantity, remaining_quantity, status, created_at, sequence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                order.order_id,
+                order.user_id,
+                order.pair.symbol,
+                order.side.value,
+                str(order.price),
+                str(order.quantity),
+                str(order.remaining_quantity),
+                order.status.value,
+                order.created_at.isoformat(),
+                order.sequence,
+            ),
+        )
+
+    def _persist_trade(self, trade: Trade) -> None:
+        """将成交记录写入数据库。"""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO trades
+               (trade_id, buy_order_id, sell_order_id, buyer_id, seller_id, pair, price, quantity, quote_amount, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                trade.trade_id,
+                trade.buy_order_id,
+                trade.sell_order_id,
+                trade.buyer_id,
+                trade.seller_id,
+                trade.pair.symbol,
+                str(trade.price),
+                str(trade.quantity),
+                str(trade.quote_amount),
+                trade.timestamp.isoformat(),
+            ),
+        )
 
     def place_limit_order(
         self,
@@ -154,6 +234,17 @@ class MatchingEngine:
             self._order_book.add(order)
 
         self._orders[order.order_id] = order
+
+        if self._conn:
+            self._persist_order(order)
+            for trade in trades:
+                maker_id = (
+                    trade.sell_order_id if order.side == OrderSide.BUY else trade.buy_order_id
+                )
+                self._persist_order(self._orders[maker_id])
+                self._persist_trade(trade)
+            self._conn.commit()
+
         return OrderPlacementResult(
             order=order,
             trades=trades,
