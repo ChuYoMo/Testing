@@ -25,6 +25,8 @@ from typing import Callable, DefaultDict, Dict, Iterable, List, Optional
 from auth import AuthService
 from blockchain import SimpleBlockchain
 from exceptions import (
+    OrderNotCancellableError,
+    OrderNotFoundError,
     UnsupportedTradingPairError,
     ValidationError,
 )
@@ -58,6 +60,15 @@ class OrderBook:
     def get_orders(self, pair: TradingPair, side: OrderSide) -> List[Order]:
         """返回指定交易对与方向的订单列表（内部引用）。"""
         return self._select_book(pair, side)
+
+    def remove(self, order: Order) -> bool:
+        """从订单簿中移除指定订单。已不在簿中返回 False。"""
+        book = self._select_book(order.pair, order.side)
+        for index, candidate in enumerate(book):
+            if candidate.order_id == order.order_id:
+                book.pop(index)
+                return True
+        return False
 
     def snapshot(self, pair: TradingPair) -> Dict[str, List[dict]]:
         """返回订单簿快照。"""
@@ -257,6 +268,42 @@ class MatchingEngine:
             return self._orders[order_id]
         except KeyError as exc:
             raise ValidationError(f"订单 {order_id} 不存在。") from exc
+
+    def cancel_order(self, user_id: str, order_id: str) -> Order:
+        """撤销活跃订单，解冻剩余资金。
+
+        :raises OrderNotFoundError: 订单不存在。
+        :raises ValidationError: 不是该用户的订单。
+        :raises OrderNotCancellableError: 订单已成交或已撤销。
+        """
+        order = self._orders.get(order_id)
+        if order is None:
+            raise OrderNotFoundError(f"订单 {order_id} 不存在。")
+        if order.user_id != user_id:
+            raise ValidationError(f"订单 {order_id} 不属于用户 {user_id}。")
+        if not order.is_active():
+            raise OrderNotCancellableError(
+                f"订单 {order_id} 当前状态为 {order.status.value}，不可撤销。"
+            )
+
+        if order.side == OrderSide.BUY:
+            refund_asset = order.pair.quote_asset
+            refund_amount = normalize_decimal(order.price * order.remaining_quantity)
+        else:
+            refund_asset = order.pair.base_asset
+            refund_amount = order.remaining_quantity
+
+        if refund_amount > ZERO:
+            self._wallet_service.unfreeze(order.user_id, refund_asset, refund_amount)
+
+        self._order_book.remove(order)
+        order.status = OrderStatus.CANCELLED
+
+        if self._conn:
+            self._persist_order(order)
+            self._conn.commit()
+
+        return order
 
     def get_order_book_snapshot(self, pair: TradingPair) -> dict:
         """获取订单簿快照。"""

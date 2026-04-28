@@ -62,6 +62,14 @@ class SelfTradePreventedError(OrderError):
     """自成交保护触发异常。"""
 
 
+class OrderNotFoundError(OrderError):
+    """订单不存在异常。"""
+
+
+class OrderNotCancellableError(OrderError):
+    """订单状态不允许撤单（已成交或已撤销）异常。"""
+
+
 class BlockchainError(DEXError):
     """区块链/链式账本相关异常。"""
 

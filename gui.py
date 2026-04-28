@@ -36,9 +36,10 @@ PAIRS = {
 class DEXWebState:
     """Owns the SQLite-backed services used by the GUI server."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str = "dex.db") -> None:
         from database import init_db
-        self._conn = init_db()
+        self._db_path = db_path
+        self._conn = init_db(db_path)
         self.current_user: str | None = None
         self.last_trade_flow: list[dict[str, Any]] = []
         self._rebuild_services()
@@ -140,6 +141,20 @@ class DEXWebState:
             "message": (
                 f"订单 {result.order.order_id} 提交成功，状态 {result.order.status.value}，"
                 f"本次成交 {len(result.trades)} 笔{blocked}。"
+            )
+        }
+
+    def cancel_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        username = str(payload.get("username", "")).strip()
+        order_id = str(payload.get("order_id", "")).strip()
+        if not order_id:
+            raise ValidationError("订单号不能为空。")
+        self._ensure_registered(username)
+        order = self.engine.cancel_order(user_id=username, order_id=order_id)
+        return {
+            "message": (
+                f"订单 {order.order_id} 已撤销，剩余 {order.remaining_quantity} "
+                f"{order.pair.base_asset.value} 已解冻。"
             )
         }
 
@@ -346,6 +361,7 @@ class DEXRequestHandler(BaseHTTPRequestHandler):
             "/api/login": STATE.login,
             "/api/wallet": STATE.wallet_action,
             "/api/order": STATE.place_order,
+            "/api/cancel": STATE.cancel_order,
         }
         no_payload_routes: dict[str, Callable[[], dict[str, Any]]] = {
             "/api/seal": STATE.seal_block,
@@ -526,6 +542,14 @@ INDEX_HTML = r"""<!doctype html>
     button.success { background: var(--green); }
     button.warning { background: var(--gold); }
     button.danger { background: var(--red); }
+    button.cancel-btn {
+      width: auto;
+      height: 26px;
+      padding: 0 12px;
+      font-size: 12px;
+      background: var(--red);
+    }
+    button.cancel-btn:hover { background: #b13a3a; }
     .row {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -1030,7 +1054,7 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderOrders() {
       orders.innerHTML = table(
-        ["订单ID", "用户", "交易对", "方向", "价格", "数量", "已成交", "剩余", "状态"],
+        ["订单ID", "用户", "交易对", "方向", "价格", "数量", "已成交", "剩余", "状态", "操作"],
         state.orders.map(row => [
           row.id,
           row.user,
@@ -1040,9 +1064,21 @@ INDEX_HTML = r"""<!doctype html>
           formatDecimal(row.quantity),
           formatDecimal(row.filled),
           formatDecimal(row.remaining),
-          statusCell(row.status)
+          statusCell(row.status),
+          (row.status === "OPEN" || row.status === "PARTIALLY_FILLED")
+            ? `<button class="cancel-btn" onclick="cancelOrder('${row.id}','${row.user}')">撤单</button>`
+            : ""
         ])
       );
+    }
+
+    function cancelOrder(orderId, owner) {
+      const username = (state.current_user || owner || "").trim();
+      if (!username) {
+        setStatus("请先登录后再撤单。", true);
+        return;
+      }
+      postAction("/api/cancel", { username, order_id: orderId }, "撤单成功。");
     }
 
     function renderBooks() {

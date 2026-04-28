@@ -73,7 +73,7 @@ class TradingFlowTest(unittest.TestCase):
         self.assertEqual(eth_book["sell"][0]["remaining_quantity"], "3.00000000")
 
     def test_gui_one_click_demo_flow(self) -> None:
-        state = DEXWebState()
+        state = DEXWebState(db_path=":memory:")
         result = state.run_demo_flow()
         snapshot = state.snapshot()
 
@@ -89,7 +89,7 @@ class TradingFlowTest(unittest.TestCase):
         self.assertEqual(snapshot["last_trade_flow"][3]["trades"][0]["pair"], "ETH/USDT")
 
     def test_gui_manual_order_flow_records_trade_details(self) -> None:
-        state = DEXWebState()
+        state = DEXWebState(db_path=":memory:")
         state.place_order(
             {
                 "username": "bob",
